@@ -140,16 +140,16 @@ std::wstring s2ws(const std::string& str) {
 int main() {
     SetConsoleCtrlHandler(ConsoleCleanupHandler, TRUE);
 
-    auto config = parse_config("client.conf");
+    auto config = parse_config("tunnel.conf");
     
     // Config defaults
     std::string server_ip_str = config.count("SERVER_IP") ? config["SERVER_IP"] : "127.0.0.1";
     std::string server_port = config.count("SERVER_PORT") ? config["SERVER_PORT"] : "41195";
-    std::string tun_name = config.count("TUN_NAME") ? config["TUN_NAME"] : "GameTunnel";
-    std::string tun_ip = config.count("TUN_IP") ? config["TUN_IP"] : "10.9.0.2";
-    std::string tun_mask = config.count("TUN_MASK") ? config["TUN_MASK"] : "255.255.255.0";
-    std::string dns = config.count("DNS") ? config["DNS"] : "8.8.8.8";
-    std::string gateway = config.count("GATEWAY") ? config["GATEWAY"] : "10.9.0.1";
+    std::string tun_name = config.count("CLIENT_TUN_NAME") ? config["CLIENT_TUN_NAME"] : "GameTunnel";
+    std::string tun_ip = config.count("CLIENT_TUN_IP") ? config["CLIENT_TUN_IP"] : "10.9.0.2";
+    std::string tun_mask = config.count("CLIENT_TUN_MASK") ? config["CLIENT_TUN_MASK"] : "255.255.255.0";
+    std::string dns = config.count("CLIENT_DNS") ? config["CLIENT_DNS"] : "8.8.8.8";
+    std::string gateway = config.count("CLIENT_GATEWAY") ? config["CLIENT_GATEWAY"] : "10.9.0.1";
     std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
     std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
 

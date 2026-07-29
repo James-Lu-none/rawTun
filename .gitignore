@@ -1,4 +1,5 @@
 client.conf
 server.conf
+tunnel.conf
 client.exe
 gateway-server

@@ -67,12 +67,12 @@ int main() {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    auto config = parse_config("server.conf");
+    auto config = parse_config("tunnel.conf");
     
-    std::string port_str = config.count("PORT") ? config["PORT"] : "41195";
-    std::string tun_dev = config.count("TUN_DEV") ? config["TUN_DEV"] : "";
-    std::string tun_ip = config.count("TUN_IP") ? config["TUN_IP"] : "10.9.0.1";
-    std::string tun_mask = config.count("TUN_MASK") ? config["TUN_MASK"] : "24";
+    std::string port_str = config.count("SERVER_PORT") ? config["SERVER_PORT"] : "41195";
+    std::string tun_dev = config.count("SERVER_TUN_DEV") ? config["SERVER_TUN_DEV"] : "";
+    std::string tun_ip = config.count("SERVER_TUN_IP") ? config["SERVER_TUN_IP"] : "10.9.0.1";
+    std::string tun_mask = config.count("SERVER_TUN_MASK") ? config["SERVER_TUN_MASK"] : "24";
     std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
     std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
     
