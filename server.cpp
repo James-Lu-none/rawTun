@@ -148,7 +148,10 @@ int main() {
                     }
                     client_connected = true;
                     
-                    if (nread > 8) {
+                    if (nread == 16) {
+                        // Echo ping packet back to client
+                        sendto(udp_fd, buffer, 16, 0, (struct sockaddr *)&client_addr, client_len);
+                    } else if (nread > 8) {
                         // It's a real IP packet, strip header and inject
                         if(write(tun_fd, buffer + 8, nread - 8)) {}
                     }

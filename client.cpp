@@ -8,6 +8,7 @@
 #include <fstream>
 #include <string>
 #include <map>
+#include <chrono>
 #include <iphlpapi.h>
 
 // You must download wintun.h from the official Wintun repository and include it in your project folder
@@ -32,6 +33,10 @@ SOCKET udp_socket = INVALID_SOCKET;
 char auth_header[8] = {0};
 std::string server_ip_str;
 std::string tun_name_str;
+
+std::atomic<uint64_t> tx_bytes(0);
+std::atomic<uint64_t> rx_bytes(0);
+std::atomic<int> current_ping(0);
 
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
@@ -110,6 +115,7 @@ void WintunToUdpThread(sockaddr_in server_addr) {
             memcpy(send_buffer, auth_header, 8);
             memcpy(send_buffer + 8, packet, packetSize);
             sendto(udp_socket, send_buffer, packetSize + 8, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            tx_bytes += packetSize;
             WintunReleaseReceivePacket(session, packet);
         }
     }
@@ -121,11 +127,19 @@ void UdpToWintunThread() {
         int nread = recvfrom(udp_socket, buffer, sizeof(buffer), 0, NULL, NULL);
         if (nread >= 8) {
             if (memcmp(buffer, auth_header, 8) == 0) {
-                if (nread > 8) {
+                if (nread == 16) {
+                    // Ping echo received
+                    int64_t sent_time;
+                    memcpy(&sent_time, buffer + 8, 8);
+                    auto now = std::chrono::steady_clock::now().time_since_epoch();
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+                    current_ping = static_cast<int>(now_ms - sent_time);
+                } else if (nread > 8) {
                     BYTE* packet = WintunAllocateSendPacket(session, nread - 8);
                     if (packet) {
                         memcpy(packet, buffer + 8, nread - 8);
                         WintunSendPacket(session, packet);
+                        rx_bytes += (nread - 8);
                     }
                 }
             }
@@ -134,14 +148,26 @@ void UdpToWintunThread() {
 }
 
 void KeepAliveThread(sockaddr_in server_addr) {
+    char ping_packet[16];
+    memcpy(ping_packet, auth_header, 8);
+    
     while (keepRunning) {
-        // Send a Keep-Alive packet (just the 8-byte auth header)
-        sendto(udp_socket, auth_header, 8, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
-        // Sleep 15 seconds
-        for(int i=0; i<15 && keepRunning; ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto now = std::chrono::steady_clock::now().time_since_epoch();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        int64_t timestamp = now_ms;
+        memcpy(ping_packet + 8, &timestamp, 8);
+        
+        sendto(udp_socket, ping_packet, 16, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+        
+        std::cout << "\r[STATS] Ping: " << current_ping << " ms | Tx: " 
+                  << (tx_bytes / 1024) << " KB | Rx: " << (rx_bytes / 1024) << " KB    " << std::flush;
+        
+        // Sleep ~1 second
+        for(int i=0; i<10 && keepRunning; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
+    std::cout << std::endl;
 }
 
 // Convert std::string to std::wstring for Wintun API
