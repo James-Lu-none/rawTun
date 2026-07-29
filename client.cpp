@@ -11,6 +11,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <mutex>
 #include <iphlpapi.h>
 
 // You must download wintun.h from the official Wintun repository and include it in your project folder
@@ -93,30 +94,36 @@ std::map<std::string, std::string> parse_config(const std::string& filename) {
 }
 
 // Graceful cleanup on Ctrl+C or terminal close
-BOOL WINAPI ConsoleCleanupHandler(DWORD signal) {
-    if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        std::cout << "\n[INFO] Shutting down... Restoring network routes." << std::endl;
-        keepRunning = false;
-        
-        // Remove VPN routes BEFORE closing the adapter so we don't get "Element not found"
-        if (!tun_name_str.empty()) {
-            system(("netsh interface ipv4 delete route 0.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
-            system(("netsh interface ipv4 delete route 128.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
-        }
-        if (!server_ip_str.empty()) {
-            std::string del_server = "route delete " + server_ip_str + " mask 255.255.255.255 >nul 2>&1";
-            system(del_server.c_str());
-        }
+std::mutex cleanup_mutex;
 
-        if (session) {
-            // EndSession function pointer omitted for brevity, usually required in full API
-        }
-        if (adapter) WintunCloseAdapter(adapter);
-        if (udp_socket != INVALID_SOCKET) closesocket(udp_socket);
+void CleanupTunnel() {
+    std::lock_guard<std::mutex> lock(cleanup_mutex);
+    if (!keepRunning) return; // Prevent double cleanup
+    keepRunning = false;
 
-        WSACleanup();
-        
-        // Exiting causes Wintun driver to delete the interface, auto-reverting standard routes
+    // Remove VPN routes BEFORE closing the adapter so we don't get "Element not found"
+    if (!tun_name_str.empty()) {
+        system(("netsh interface ipv4 delete route 0.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
+        system(("netsh interface ipv4 delete route 128.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
+    }
+    if (!server_ip_str.empty()) {
+        std::string del_server = "route delete " + server_ip_str + " mask 255.255.255.255 >nul 2>&1";
+        system(del_server.c_str());
+    }
+
+    if (session) {
+        // EndSession function pointer omitted for brevity, usually required in full API
+    }
+    if (adapter) WintunCloseAdapter(adapter);
+    if (udp_socket != INVALID_SOCKET) closesocket(udp_socket);
+
+    WSACleanup();
+}
+
+BOOL WINAPI ConsoleCleanupHandler(DWORD dwCtrlType) {
+    if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_CLOSE_EVENT) {
+        std::cout << "\n[INFO] Signal received. Shutting down... Restoring network routes." << std::endl;
+        CleanupTunnel();
         ExitProcess(0);
         return TRUE;
     }
@@ -300,15 +307,28 @@ int main() {
     server_addr.sin_port = htons(std::stoi(server_port));
     inet_pton(AF_INET, server_ip_str.c_str(), &server_addr.sin_addr);
 
-    std::cout << "[INFO] Tunnel Active! Authenticating and forwarding packets to " << server_ip_str << ":" << server_port << "..." << std::endl;
+    std::cout << "[INFO] Tunnel is now active. Authenticating and forwarding packets to " << server_ip_str << ":" << server_port << "..." << std::endl;
+    std::cout << "[INFO] Press ENTER to gracefully stop the tunnel." << std::endl;
 
     std::thread t1(WintunToUdpThread, server_addr);
     std::thread t2(UdpToWintunThread);
     std::thread t3(KeepAliveThread, server_addr, enable_stats);
 
-    t1.join();
-    t2.join();
-    t3.join();
+    // Wait for user to press Enter
+    std::cin.get();
+
+    if (keepRunning) {
+        std::cout << "\n[INFO] Enter pressed. Shutting down... Restoring network routes." << std::endl;
+        CleanupTunnel();
+    }
+
+    if (t1.joinable()) t1.join();
+    if (t2.joinable()) t2.join();
+    if (t3.joinable()) t3.join();
+
+    std::cout << "[INFO] Tunnel successfully stopped. Network restored." << std::endl;
+    std::cout << "[INFO] Press ENTER to close this window." << std::endl;
+    std::cin.get();
 
     return 0;
 }
