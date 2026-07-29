@@ -54,6 +54,21 @@ std::string format_bytes(uint64_t bytes) {
     return out.str();
 }
 
+std::string format_bits_per_sec(uint64_t bytes_per_sec) {
+    uint64_t bits = bytes_per_sec * 8;
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    if (bits >= 1000ULL * 1000 * 1000)
+        out << (bits / (1000.0 * 1000 * 1000)) << " Gbps";
+    else if (bits >= 1000 * 1000)
+        out << (bits / (1000.0 * 1000)) << " Mbps";
+    else if (bits >= 1000)
+        out << (bits / 1000.0) << " Kbps";
+    else
+        out << bits << " bps";
+    return out.str();
+}
+
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
     std::ifstream file(filename);
@@ -185,8 +200,8 @@ void KeepAliveThread(sockaddr_in server_addr, bool enable_stats) {
             uint64_t rx_speed = current_rx - last_rx;
             
             std::cout << "\r[STATS] Ping: " << current_ping << " ms | "
-                      << "Tx: " << format_bytes(current_tx) << " (" << format_bytes(tx_speed) << "/s) | "
-                      << "Rx: " << format_bytes(current_rx) << " (" << format_bytes(rx_speed) << "/s)          " 
+                      << "Tx: " << format_bytes(current_tx) << " (" << format_bits_per_sec(tx_speed) << ") | "
+                      << "Rx: " << format_bytes(current_rx) << " (" << format_bits_per_sec(rx_speed) << ")          " 
                       << std::flush;
                       
             last_tx = current_tx;
