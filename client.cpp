@@ -31,6 +31,7 @@ WINTUN_SESSION_HANDLE session = NULL;
 SOCKET udp_socket = INVALID_SOCKET;
 char auth_header[8] = {0};
 std::string server_ip_str;
+std::string tun_name_str;
 
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
@@ -68,8 +69,10 @@ BOOL WINAPI ConsoleCleanupHandler(DWORD signal) {
         if (udp_socket != INVALID_SOCKET) closesocket(udp_socket);
         
         // Remove VPN routes
-        system("route delete 0.0.0.0 mask 128.0.0.0");
-        system("route delete 128.0.0.0 mask 128.0.0.0");
+        if (!tun_name_str.empty()) {
+            system(("netsh interface ipv4 delete route 0.0.0.0/1 \"" + tun_name_str + "\"").c_str());
+            system(("netsh interface ipv4 delete route 128.0.0.0/1 \"" + tun_name_str + "\"").c_str());
+        }
         if (!server_ip_str.empty()) {
             std::string del_server = "route delete " + server_ip_str + " mask 255.255.255.255";
             system(del_server.c_str());
@@ -157,7 +160,8 @@ int main() {
     // Config defaults
     server_ip_str = config.count("SERVER_IP") ? config["SERVER_IP"] : "127.0.0.1";
     std::string server_port = config.count("SERVER_PORT") ? config["SERVER_PORT"] : "41195";
-    std::string tun_name = config.count("CLIENT_TUN_NAME") ? config["CLIENT_TUN_NAME"] : "GameTunnel";
+    tun_name_str = config.count("CLIENT_TUN_NAME") ? config["CLIENT_TUN_NAME"] : "GameTunnel";
+    std::string tun_name = tun_name_str;
     std::string tun_ip = config.count("CLIENT_TUN_IP") ? config["CLIENT_TUN_IP"] : "10.9.0.2";
     std::string tun_mask = config.count("CLIENT_TUN_MASK") ? config["CLIENT_TUN_MASK"] : "255.255.255.0";
     std::string dns = config.count("CLIENT_DNS") ? config["CLIENT_DNS"] : "8.8.8.8";
@@ -210,8 +214,8 @@ int main() {
 
     // 2. Add two /1 routes to cleanly override the default 0.0.0.0/0 route
     std::cout << "[INFO] Overriding default routes to force traffic through tunnel..." << std::endl;
-    std::string route1 = "route add 0.0.0.0 mask 128.0.0.0 " + gateway;
-    std::string route2 = "route add 128.0.0.0 mask 128.0.0.0 " + gateway;
+    std::string route1 = "netsh interface ipv4 add route 0.0.0.0/1 \"" + tun_name + "\" " + gateway + " store=active";
+    std::string route2 = "netsh interface ipv4 add route 128.0.0.0/1 \"" + tun_name + "\" " + gateway + " store=active";
     system(route1.c_str());
     system(route2.c_str());
 
