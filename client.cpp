@@ -98,21 +98,21 @@ BOOL WINAPI ConsoleCleanupHandler(DWORD signal) {
         std::cout << "\n[INFO] Shutting down... Restoring network routes." << std::endl;
         keepRunning = false;
         
+        // Remove VPN routes BEFORE closing the adapter so we don't get "Element not found"
+        if (!tun_name_str.empty()) {
+            system(("netsh interface ipv4 delete route 0.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
+            system(("netsh interface ipv4 delete route 128.0.0.0/1 \"" + tun_name_str + "\" >nul 2>&1").c_str());
+        }
+        if (!server_ip_str.empty()) {
+            std::string del_server = "route delete " + server_ip_str + " mask 255.255.255.255 >nul 2>&1";
+            system(del_server.c_str());
+        }
+
         if (session) {
             // EndSession function pointer omitted for brevity, usually required in full API
         }
         if (adapter) WintunCloseAdapter(adapter);
         if (udp_socket != INVALID_SOCKET) closesocket(udp_socket);
-        
-        // Remove VPN routes
-        if (!tun_name_str.empty()) {
-            system(("netsh interface ipv4 delete route 0.0.0.0/1 \"" + tun_name_str + "\"").c_str());
-            system(("netsh interface ipv4 delete route 128.0.0.0/1 \"" + tun_name_str + "\"").c_str());
-        }
-        if (!server_ip_str.empty()) {
-            std::string del_server = "route delete " + server_ip_str + " mask 255.255.255.255";
-            system(del_server.c_str());
-        }
 
         WSACleanup();
         
