@@ -51,7 +51,7 @@ int tun_alloc(char *dev) {
     if ((fd = open("/dev/net/tun", O_RDWR)) < 0) return fd;
 
     memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; // IFF_NO_PI strips the extra packet info header
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; 
 
     if (*dev) strncpy(ifr.ifr_name, dev, IFNAMSIZ);
 
@@ -69,11 +69,15 @@ int main() {
 
     auto config = parse_config("server.conf");
     
-    // Config defaults
     std::string port_str = config.count("PORT") ? config["PORT"] : "41195";
     std::string tun_dev = config.count("TUN_DEV") ? config["TUN_DEV"] : "";
     std::string tun_ip = config.count("TUN_IP") ? config["TUN_IP"] : "10.9.0.1";
     std::string tun_mask = config.count("TUN_MASK") ? config["TUN_MASK"] : "24";
+    std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
+    std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
+    
+    char auth_header[8] = {0};
+    strncpy(auth_header, secret.c_str(), 8);
 
     char tun_name[IFNAMSIZ] = {0};
     if (!tun_dev.empty()) {
@@ -88,13 +92,14 @@ int main() {
 
     std::cout << "[INFO] Allocated TUN device: " << tun_name << std::endl;
 
-    // Configure the IP of tun_name via system
     std::string ip_cmd = "ip addr add " + tun_ip + "/" + tun_mask + " dev " + tun_name;
+    std::string mtu_cmd = "ip link set dev " + std::string(tun_name) + " mtu " + mtu;
     std::string up_cmd = "ip link set dev " + std::string(tun_name) + " up";
     
-    std::cout << "[INFO] Configuring IP: " << ip_cmd << std::endl;
-    system(ip_cmd.c_str());
-    system(up_cmd.c_str());
+    std::cout << "[INFO] Configuring IP and MTU " << mtu << "..." << std::endl;
+    if(system(ip_cmd.c_str())) {}
+    if(system(mtu_cmd.c_str())) {}
+    if(system(up_cmd.c_str())) {}
 
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in server_addr = {}, client_addr = {};
@@ -112,10 +117,11 @@ int main() {
     fds[1].fd = udp_fd; fds[1].events = POLLIN;
 
     char buffer[65535];
+    char send_buffer[65535];
     socklen_t client_len = sizeof(client_addr);
     bool client_connected = false;
 
-    std::cout << "[INFO] Server active on UDP port " << port_str << ". Awaiting packets..." << std::endl;
+    std::cout << "[INFO] Server active on UDP port " << port_str << " with auth check. Awaiting packets..." << std::endl;
 
     while (keepRunning) {
         if (poll(fds, 2, 1000) < 0) break;
@@ -123,21 +129,30 @@ int main() {
         if (fds[0].revents & POLLIN) {
             int nread = read(tun_fd, buffer, sizeof(buffer));
             if (nread > 0 && client_connected) {
-                sendto(udp_fd, buffer, nread, 0, (struct sockaddr *)&client_addr, client_len);
+                // Prepend auth header
+                memcpy(send_buffer, auth_header, 8);
+                memcpy(send_buffer + 8, buffer, nread);
+                sendto(udp_fd, send_buffer, nread + 8, 0, (struct sockaddr *)&client_addr, client_len);
             }
         }
 
         if (fds[1].revents & POLLIN) {
             int nread = recvfrom(udp_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
-            if (nread > 0) {
-                if (!client_connected) {
-                    char client_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-                    std::cout << "[INFO] First packet received. Client locked to " 
-                              << client_ip << ":" << ntohs(client_addr.sin_port) << std::endl;
+            if (nread >= 8) {
+                if (memcmp(buffer, auth_header, 8) == 0) {
+                    if (!client_connected) {
+                        char client_ip[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+                        std::cout << "[INFO] Authenticated packet received. Client locked to " 
+                                  << client_ip << ":" << ntohs(client_addr.sin_port) << std::endl;
+                    }
+                    client_connected = true;
+                    
+                    if (nread > 8) {
+                        // It's a real IP packet, strip header and inject
+                        if(write(tun_fd, buffer + 8, nread - 8)) {}
+                    }
                 }
-                client_connected = true;
-                write(tun_fd, buffer, nread);
             }
         }
     }

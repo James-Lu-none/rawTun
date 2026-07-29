@@ -27,6 +27,7 @@ std::atomic<bool> keepRunning(true);
 WINTUN_ADAPTER_HANDLE adapter = NULL;
 WINTUN_SESSION_HANDLE session = NULL;
 SOCKET udp_socket = INVALID_SOCKET;
+char auth_header[8] = {0};
 
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
@@ -86,11 +87,14 @@ bool InitializeWintun() {
 }
 
 void WintunToUdpThread(sockaddr_in server_addr) {
+    char send_buffer[65535];
     while (keepRunning) {
         DWORD packetSize;
         BYTE* packet = WintunReceivePacket(session, &packetSize);
         if (packet) {
-            sendto(udp_socket, (const char*)packet, packetSize, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+            memcpy(send_buffer, auth_header, 8);
+            memcpy(send_buffer + 8, packet, packetSize);
+            sendto(udp_socket, send_buffer, packetSize + 8, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
             WintunReleaseReceivePacket(session, packet);
         }
     }
@@ -100,12 +104,27 @@ void UdpToWintunThread() {
     char buffer[65535];
     while (keepRunning) {
         int nread = recvfrom(udp_socket, buffer, sizeof(buffer), 0, NULL, NULL);
-        if (nread > 0) {
-            BYTE* packet = WintunAllocateSendPacket(session, nread);
-            if (packet) {
-                memcpy(packet, buffer, nread);
-                WintunSendPacket(session, packet);
+        if (nread >= 8) {
+            if (memcmp(buffer, auth_header, 8) == 0) {
+                if (nread > 8) {
+                    BYTE* packet = WintunAllocateSendPacket(session, nread - 8);
+                    if (packet) {
+                        memcpy(packet, buffer + 8, nread - 8);
+                        WintunSendPacket(session, packet);
+                    }
+                }
             }
+        }
+    }
+}
+
+void KeepAliveThread(sockaddr_in server_addr) {
+    while (keepRunning) {
+        // Send a Keep-Alive packet (just the 8-byte auth header)
+        sendto(udp_socket, auth_header, 8, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+        // Sleep 15 seconds
+        for(int i=0; i<15 && keepRunning; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 }
@@ -131,6 +150,10 @@ int main() {
     std::string tun_mask = config.count("TUN_MASK") ? config["TUN_MASK"] : "255.255.255.0";
     std::string dns = config.count("DNS") ? config["DNS"] : "8.8.8.8";
     std::string gateway = config.count("GATEWAY") ? config["GATEWAY"] : "10.9.0.1";
+    std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
+    std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
+
+    strncpy(auth_header, secret.c_str(), 8);
 
     if (!InitializeWintun()) {
         std::cerr << "[ERROR] Failed to load wintun.dll. Is it in the same directory?" << std::endl;
@@ -147,10 +170,13 @@ int main() {
         return 1;
     }
 
-    std::cout << "[INFO] Assigning Virtual IP: " << tun_ip << "..." << std::endl;
+    std::cout << "[INFO] Assigning Virtual IP and MTU " << mtu << "..." << std::endl;
     std::string ip_cmd = "netsh interface ip set address name=\"" + tun_name + "\" static " + tun_ip + " " + tun_mask + " none";
     system(ip_cmd.c_str());
     
+    std::string mtu_cmd = "netsh interface ipv4 set subinterface \"" + tun_name + "\" mtu=" + mtu + " store=persistent";
+    system(mtu_cmd.c_str());
+
     std::cout << "[INFO] Assigning DNS Server: " << dns << "..." << std::endl;
     std::string dns_cmd = "netsh interface ip set dnsservers name=\"" + tun_name + "\" static " + dns + " validate=no";
     system(dns_cmd.c_str());
@@ -166,13 +192,15 @@ int main() {
     server_addr.sin_port = htons(std::stoi(server_port));
     inet_pton(AF_INET, server_ip_str.c_str(), &server_addr.sin_addr);
 
-    std::cout << "[INFO] Tunnel Active! Forwarding packets to " << server_ip_str << ":" << server_port << "..." << std::endl;
+    std::cout << "[INFO] Tunnel Active! Authenticating and forwarding packets to " << server_ip_str << ":" << server_port << "..." << std::endl;
 
     std::thread t1(WintunToUdpThread, server_addr);
     std::thread t2(UdpToWintunThread);
+    std::thread t3(KeepAliveThread, server_addr);
 
     t1.join();
     t2.join();
+    t3.join();
 
     return 0;
 }
