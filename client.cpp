@@ -9,6 +9,8 @@
 #include <string>
 #include <map>
 #include <chrono>
+#include <iomanip>
+#include <sstream>
 #include <iphlpapi.h>
 
 // You must download wintun.h from the official Wintun repository and include it in your project folder
@@ -37,6 +39,20 @@ std::string tun_name_str;
 std::atomic<uint64_t> tx_bytes(0);
 std::atomic<uint64_t> rx_bytes(0);
 std::atomic<int> current_ping(0);
+
+std::string format_bytes(uint64_t bytes) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    if (bytes >= 1024ULL * 1024 * 1024)
+        out << (bytes / (1024.0 * 1024 * 1024)) << " GB";
+    else if (bytes >= 1024 * 1024)
+        out << (bytes / (1024.0 * 1024)) << " MB";
+    else if (bytes >= 1024)
+        out << (bytes / 1024.0) << " KB";
+    else
+        out << bytes << " B";
+    return out.str();
+}
 
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
@@ -147,10 +163,13 @@ void UdpToWintunThread() {
     }
 }
 
-void KeepAliveThread(sockaddr_in server_addr) {
+void KeepAliveThread(sockaddr_in server_addr, bool enable_stats) {
     char ping_packet[16];
     memcpy(ping_packet, auth_header, 8);
     
+    uint64_t last_tx = 0;
+    uint64_t last_rx = 0;
+
     while (keepRunning) {
         auto now = std::chrono::steady_clock::now().time_since_epoch();
         auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
@@ -159,15 +178,27 @@ void KeepAliveThread(sockaddr_in server_addr) {
         
         sendto(udp_socket, ping_packet, 16, 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
         
-        std::cout << "\r[STATS] Ping: " << current_ping << " ms | Tx: " 
-                  << (tx_bytes / 1024) << " KB | Rx: " << (rx_bytes / 1024) << " KB    " << std::flush;
+        if (enable_stats) {
+            uint64_t current_tx = tx_bytes.load();
+            uint64_t current_rx = rx_bytes.load();
+            uint64_t tx_speed = current_tx - last_tx;
+            uint64_t rx_speed = current_rx - last_rx;
+            
+            std::cout << "\r[STATS] Ping: " << current_ping << " ms | "
+                      << "Tx: " << format_bytes(current_tx) << " (" << format_bytes(tx_speed) << "/s) | "
+                      << "Rx: " << format_bytes(current_rx) << " (" << format_bytes(rx_speed) << "/s)          " 
+                      << std::flush;
+                      
+            last_tx = current_tx;
+            last_rx = current_rx;
+        }
         
         // Sleep ~1 second
         for(int i=0; i<10 && keepRunning; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
-    std::cout << std::endl;
+    if (enable_stats) std::cout << std::endl;
 }
 
 // Convert std::string to std::wstring for Wintun API
@@ -194,6 +225,7 @@ int main() {
     std::string gateway = config.count("CLIENT_GATEWAY") ? config["CLIENT_GATEWAY"] : "10.9.0.1";
     std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
     std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
+    bool enable_stats = (config.count("STATS") && config["STATS"] == "0") ? false : true;
 
     strncpy(auth_header, secret.c_str(), 8);
 
@@ -257,7 +289,7 @@ int main() {
 
     std::thread t1(WintunToUdpThread, server_addr);
     std::thread t2(UdpToWintunThread);
-    std::thread t3(KeepAliveThread, server_addr);
+    std::thread t3(KeepAliveThread, server_addr, enable_stats);
 
     t1.join();
     t2.join();
