@@ -28,6 +28,7 @@ void sig_handler(int signo) {
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
     std::ifstream file(filename);
+    if (!file) throw std::runtime_error("Cannot open configuration: " + filename);
     std::string line;
     while (std::getline(file, line)) {
         size_t comment = line.find('#');
@@ -144,6 +145,7 @@ int main() {
     memcpy(buffer, auth_header, 8);
     bool client_connected = false;
     uint64_t tx_errors = 0, rx_errors = 0, invalid = 0;
+    uint64_t short_packets = 0, auth_failed = 0, bad_ipv4 = 0, ping_received = 0;
     auto next_stats = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     std::cout << "[INFO] Server active on UDP port " << port_str << std::endl;
 
@@ -173,15 +175,26 @@ int main() {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) ++rx_errors;
                     break;
                 }
-                if (n < 8 || memcmp(buffer, auth_header, 8) != 0) { ++invalid; continue; }
+                if (n < 8) { ++invalid; ++short_packets; continue; }
+                if (memcmp(buffer, auth_header, 8) != 0) {
+                    ++invalid;
+                    if (++auth_failed == 1) {
+                        char ip[INET_ADDRSTRLEN];
+                        inet_ntop(AF_INET, &sender.sin_addr, ip, sizeof(ip));
+                        std::cerr << "[WARN] Header mismatch from " << ip << ":" << ntohs(sender.sin_port)
+                                  << "; check both SECRET settings and loaded config paths.\n";
+                    }
+                    continue;
+                }
                 // Legacy keepalive is exactly 8-byte header + 8-byte timestamp.
                 if (n != 16) {
-                    if (!rawtun::valid_ipv4(buffer + 8, n - 8)) { ++invalid; continue; }
+                    if (!rawtun::valid_ipv4(buffer + 8, n - 8)) { ++invalid; ++bad_ipv4; continue; }
                 }
                 // Never change the active peer before validating the datagram.
                 client_addr = sender;
                 client_connected = true;
                 if (n == 16) {
+                    ++ping_received;
                     if (sendto(udp_fd, buffer, n, 0, reinterpret_cast<sockaddr*>(&sender), sender_len) != n)
                         ++tx_errors;
                 } else if (write(tun_fd, buffer + 8, n - 8) != n - 8) ++rx_errors;
@@ -205,7 +218,9 @@ int main() {
         if (now >= next_stats) {
             if (tx_errors || rx_errors || invalid)
                 std::cout << "[STATS] cumulative tx_errors=" << tx_errors
-                          << " rx_errors=" << rx_errors << " invalid=" << invalid << std::endl;
+                          << " rx_errors=" << rx_errors << " invalid=" << invalid
+                          << " short=" << short_packets << " auth_failed=" << auth_failed
+                          << " bad_ipv4=" << bad_ipv4 << " ping_received=" << ping_received << std::endl;
             next_stats = now + std::chrono::seconds(10);
         }
     }

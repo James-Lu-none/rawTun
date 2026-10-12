@@ -40,6 +40,8 @@ static HANDLE cleanup_done = NULL;
 static bool route1_added = false, route2_added = false, server_route_added = false;
 static std::string server_route_delete;
 std::atomic<uint64_t> tx_errors(0), rx_errors(0), invalid_packets(0);
+std::atomic<uint64_t> tx_invalid(0);
+std::atomic<int> last_send_error(0);
 
 std::atomic<bool> keepRunning(true);
 WINTUN_ADAPTER_HANDLE adapter = NULL;
@@ -86,6 +88,7 @@ std::string format_bits_per_sec(uint64_t bytes_per_sec) {
 std::map<std::string, std::string> parse_config(const std::string& filename) {
     std::map<std::string, std::string> config;
     std::ifstream file(filename);
+    if (!file) throw std::runtime_error("Cannot open configuration: " + filename);
     std::string line;
     while (std::getline(file, line)) {
         size_t comment = line.find('#');
@@ -176,8 +179,11 @@ void WintunToUdpThread(sockaddr_in server_addr) {
                 DWORD sent = 0;
                 if (WSASend(udp_socket, buffers, 2, &sent, 0, NULL, NULL) == 0 && sent == packetSize + 8)
                     tx_bytes.fetch_add(packetSize, std::memory_order_relaxed);
-                else tx_errors.fetch_add(1, std::memory_order_relaxed);
-            } else tx_errors.fetch_add(1, std::memory_order_relaxed);
+                else {
+                    last_send_error = WSAGetLastError();
+                    tx_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else tx_invalid.fetch_add(1, std::memory_order_relaxed);
             WintunReleaseReceivePacket(session, packet);
         } else {
             DWORD error = GetLastError();
@@ -253,7 +259,7 @@ void KeepAliveThread(sockaddr_in server_addr, bool enable_stats) {
         int64_t timestamp = now_ms;
         memcpy(ping_packet + 8, &timestamp, 8);
         
-        if (send(udp_socket, ping_packet, 16, 0) != 16) ++tx_errors;
+        if (send(udp_socket, ping_packet, 16, 0) != 16) { last_send_error = WSAGetLastError(); ++tx_errors; }
         
         if (enable_stats) {
             uint64_t current_tx = tx_bytes.load();
@@ -268,7 +274,8 @@ void KeepAliveThread(sockaddr_in server_addr, bool enable_stats) {
             std::cout << "\r[STATS] Ping: " << current_ping << " ms | "
                       << "Tx: " << format_bytes(current_tx) << " (" << format_bits_per_sec(tx_speed) << ") | "
                       << "Errors Tx/Rx: " << tx_errors.load() << "/" << rx_errors.load()
-                      << " Invalid: " << invalid_packets.load() << " | "
+                      << " Invalid Tx/Rx: " << tx_invalid.load() << "/" << invalid_packets.load()
+                      << " LastWSA: " << last_send_error.load() << " | "
                       << "Rx: " << format_bytes(current_rx) << " (" << format_bits_per_sec(rx_speed) << ")          " 
                       << std::flush;
                       
@@ -297,7 +304,13 @@ int main() {
     SetConsoleCtrlHandler(ConsoleCleanupHandler, TRUE);
 
     try {
-    auto config = parse_config("tunnel.conf");
+    char executable[MAX_PATH];
+    DWORD path_length = GetModuleFileNameA(NULL, executable, MAX_PATH);
+    if (!path_length || path_length >= MAX_PATH) throw std::runtime_error("Cannot resolve executable directory");
+    std::string config_path(executable, path_length);
+    config_path = config_path.substr(0, config_path.find_last_of("\\/" ) + 1) + "tunnel.conf";
+    std::cout << "[INFO] Configuration: " << config_path << std::endl;
+    auto config = parse_config(config_path);
     
     // Config defaults
     server_ip_str = config.count("SERVER_IP") ? config["SERVER_IP"] : "127.0.0.1";
