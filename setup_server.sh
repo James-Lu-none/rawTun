@@ -9,8 +9,26 @@ fi
 # Get absolute path to the directory containing this script
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
+for dependency in g++ ip iptables sysctl awk systemctl; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        echo "Missing dependency: $dependency (Ubuntu packages: g++ iproute2 iptables procps mawk)." >&2
+        exit 1
+    fi
+done
+if [ ! -f "$DIR/tunnel.conf" ]; then
+    echo "Create $DIR/tunnel.conf before running setup." >&2
+    exit 1
+fi
+
 echo "Compiling server.cpp..."
 g++ -Wall -O2 -std=c++11 "$DIR/server.cpp" -o "$DIR/gateway-server"
+
+echo "Configuring persistent IPv4 forwarding..."
+cat > /etc/sysctl.d/99-rawtun.conf <<'SYSCTL'
+net.ipv4.ip_forward=1
+SYSCTL
+# Configure now; systemd also reapplies the rules before every server start.
+/bin/bash "$DIR/setup_network.sh"
 
 echo "Creating systemd service..."
 cat << EOF > /etc/systemd/system/gateway-server.service
@@ -21,8 +39,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$DIR/gateway-server
-WorkingDirectory=$DIR
+ExecStartPre=/bin/bash "$DIR/setup_network.sh"
+ExecStart="$DIR/gateway-server"
+WorkingDirectory="$DIR"
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=10

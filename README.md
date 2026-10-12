@@ -13,10 +13,12 @@ journalctl -u gateway-server -f
 ```
 
 Stop the old Windows client before replacing `client.exe`; keep `wintun.dll` and
-`tunnel.conf` beside it and run as Administrator. The full IPv4 routes, MTU default
-of 1400, and 4 MiB Wintun ring remain unchanged. Existing EC2 forwarding, firewall,
-NAT, and source/destination-check settings must remain in place; setup does not
-change these settings.
+`tunnel.conf` beside it and run as Administrator.
+`setup_server.sh` enables persistent IPv4 forwarding and invokes
+`setup_network.sh` to configure MASQUERADE and forwarding rules for the configured
+server TUN subnet. The internet interface is detected from the IPv4 route
+(e.g. `ens5`). Set `SERVER_TUN_DEV=tun0` in `tunnel.conf`; forwarding rules
+use this explicit interface.
 
 ## Forwarding and shutdown
 
