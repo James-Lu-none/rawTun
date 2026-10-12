@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root (e.g. sudo ./setup_server.sh)"
@@ -10,23 +11,21 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 
 echo "Compiling server.cpp..."
 g++ -Wall -O2 -std=c++11 "$DIR/server.cpp" -o "$DIR/gateway-server"
-if [ $? -ne 0 ]; then
-    echo "Compilation failed! Ensure g++ is installed."
-    exit 1
-fi
 
 echo "Creating systemd service..."
 cat << EOF > /etc/systemd/system/gateway-server.service
 [Unit]
 Description=Gateway Server (UDP Tunnel)
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 ExecStart=$DIR/gateway-server
 WorkingDirectory=$DIR
 Restart=on-failure
-RestartSec=5
+RestartSec=2
+TimeoutStopSec=10
 User=root
 
 [Install]
