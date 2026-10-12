@@ -1,4 +1,5 @@
 #include <iostream>
+#include "protocol.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -12,8 +13,11 @@
 #include <map>
 #include <fstream>
 #include <string>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
 
-volatile bool keepRunning = true;
+volatile sig_atomic_t keepRunning = 1;
 
 void sig_handler(int signo) {
     if (signo == SIGINT || signo == SIGTERM) {
@@ -33,10 +37,11 @@ std::map<std::string, std::string> parse_config(const std::string& filename) {
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq + 1);
             key.erase(0, key.find_first_not_of(" \t"));
-            key.erase(key.find_last_not_of(" \t") + 1);
+            key.erase(key.find_last_not_of(" \t\r") + 1);
+            if (val.find_first_not_of(" \t\r") == std::string::npos) val.clear();
             if (!val.empty()) {
                 val.erase(0, val.find_first_not_of(" \t"));
-                val.erase(val.find_last_not_of(" \t") + 1);
+                val.erase(val.find_last_not_of(" \t\r") + 1);
             }
             config[key] = val;
         }
@@ -67,6 +72,7 @@ int main() {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
+    try {
     auto config = parse_config("tunnel.conf");
     
     std::string port_str = config.count("SERVER_PORT") ? config["SERVER_PORT"] : "41195";
@@ -76,8 +82,15 @@ int main() {
     std::string secret = config.count("SECRET") ? config["SECRET"] : "RawTunV1";
     std::string mtu = config.count("MTU") ? config["MTU"] : "1400";
     
+    rawtun::number(port_str, 1, 65535);
+    rawtun::number(mtu, 576, rawtun::max_ip_size);
+    rawtun::number(tun_mask, 0, 32);
+    in_addr check = {};
+    if (inet_pton(AF_INET, tun_ip.c_str(), &check) != 1 ||
+        (!tun_dev.empty() && (!rawtun::safe_name(tun_dev) || tun_dev.size() >= IFNAMSIZ || tun_dev.find(' ') != std::string::npos)))
+        throw std::runtime_error("Invalid TUN configuration");
     char auth_header[8] = {0};
-    strncpy(auth_header, secret.c_str(), 8);
+    memcpy(auth_header, secret.data(), std::min(secret.size(), sizeof(auth_header)));
 
     char tun_name[IFNAMSIZ] = {0};
     if (!tun_dev.empty()) {
@@ -97,11 +110,19 @@ int main() {
     std::string up_cmd = "ip link set dev " + std::string(tun_name) + " up";
     
     std::cout << "[INFO] Configuring IP and MTU " << mtu << "..." << std::endl;
-    if(system(ip_cmd.c_str())) {}
-    if(system(mtu_cmd.c_str())) {}
-    if(system(up_cmd.c_str())) {}
+    if (system(ip_cmd.c_str()) || system(mtu_cmd.c_str()) || system(up_cmd.c_str())) {
+        std::cerr << "[ERROR] Interface configuration failed.\n";
+        close(tun_fd);
+        return 1;
+    }
 
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (udp_fd < 0 || fcntl(tun_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("socket/nonblocking");
+        if (udp_fd >= 0) close(udp_fd);
+        close(tun_fd);
+        return 1;
+    }
     struct sockaddr_in server_addr = {}, client_addr = {};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
@@ -109,6 +130,8 @@ int main() {
 
     if (bind(udp_fd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         std::cerr << "[ERROR] Failed to bind to UDP port " << port_str << std::endl;
+        close(udp_fd);
+        close(tun_fd);
         return 1;
     }
 
@@ -116,52 +139,83 @@ int main() {
     fds[0].fd = tun_fd; fds[0].events = POLLIN;
     fds[1].fd = udp_fd; fds[1].events = POLLIN;
 
+    // Reserve header space and read directly behind it: no payload copy on TX.
     char buffer[65535];
-    char send_buffer[65535];
-    socklen_t client_len = sizeof(client_addr);
+    memcpy(buffer, auth_header, 8);
     bool client_connected = false;
+    uint64_t tx_errors = 0, rx_errors = 0, invalid = 0;
+    auto next_stats = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::cout << "[INFO] Server active on UDP port " << port_str << std::endl;
 
-    std::cout << "[INFO] Server active on UDP port " << port_str << " with auth check. Awaiting packets..." << std::endl;
-
+    bool failed = false;
     while (keepRunning) {
-        if (poll(fds, 2, 1000) < 0) break;
-
-        if (fds[0].revents & POLLIN) {
-            int nread = read(tun_fd, buffer, sizeof(buffer));
-            if (nread > 0 && client_connected) {
-                // Prepend auth header
-                memcpy(send_buffer, auth_header, 8);
-                memcpy(send_buffer + 8, buffer, nread);
-                sendto(udp_fd, send_buffer, nread + 8, 0, (struct sockaddr *)&client_addr, client_len);
+        int ready = poll(fds, 2, 1000);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            failed = true;
+            break;
+        }
+        if ((fds[0].revents | fds[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
+            std::cerr << "[ERROR] Tunnel/socket poll failure.\n";
+            failed = true;
+            break;
+        }
+        // Bound each drain so neither direction can starve the other.
+        if (fds[1].revents & POLLIN) {
+            for (int i = 0; i < 32 && keepRunning; ++i) {
+                sockaddr_in sender = {};
+                socklen_t sender_len = sizeof(sender);
+                ssize_t n = recvfrom(udp_fd, buffer, sizeof(buffer), 0,
+                                     reinterpret_cast<sockaddr*>(&sender), &sender_len);
+                if (n < 0) {
+                    if (errno == EINTR) { --i; continue; }
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) ++rx_errors;
+                    break;
+                }
+                if (n < 8 || memcmp(buffer, auth_header, 8) != 0) { ++invalid; continue; }
+                // Legacy keepalive is exactly 8-byte header + 8-byte timestamp.
+                if (n != 16) {
+                    if (!rawtun::valid_ipv4(buffer + 8, n - 8)) { ++invalid; continue; }
+                }
+                // Never change the active peer before validating the datagram.
+                client_addr = sender;
+                client_connected = true;
+                if (n == 16) {
+                    if (sendto(udp_fd, buffer, n, 0, reinterpret_cast<sockaddr*>(&sender), sender_len) != n)
+                        ++tx_errors;
+                } else if (write(tun_fd, buffer + 8, n - 8) != n - 8) ++rx_errors;
             }
         }
-
-        if (fds[1].revents & POLLIN) {
-            int nread = recvfrom(udp_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &client_len);
-            if (nread >= 8) {
-                if (memcmp(buffer, auth_header, 8) == 0) {
-                    if (!client_connected) {
-                        char client_ip[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-                        std::cout << "[INFO] Authenticated packet received. Client locked to " 
-                                  << client_ip << ":" << ntohs(client_addr.sin_port) << std::endl;
-                    }
-                    client_connected = true;
-                    
-                    if (nread == 16) {
-                        // Echo ping packet back to client
-                        sendto(udp_fd, buffer, 16, 0, (struct sockaddr *)&client_addr, client_len);
-                    } else if (nread > 8) {
-                        // It's a real IP packet, strip header and inject
-                        if(write(tun_fd, buffer + 8, nread - 8)) {}
-                    }
+        if (fds[0].revents & POLLIN) {
+            memcpy(buffer, auth_header, 8);
+            for (int i = 0; i < 32 && keepRunning; ++i) {
+                ssize_t n = read(tun_fd, buffer + 8, sizeof(buffer) - 8);
+                if (n < 0) {
+                    if (errno == EINTR) { --i; continue; }
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) ++tx_errors;
+                    break;
                 }
+                if (n == 0) break;
+                if (client_connected && sendto(udp_fd, buffer, n + 8, 0,
+                    reinterpret_cast<sockaddr*>(&client_addr), sizeof(client_addr)) != n + 8) ++tx_errors;
             }
+        }
+        auto now = std::chrono::steady_clock::now();
+        if (now >= next_stats) {
+            if (tx_errors || rx_errors || invalid)
+                std::cout << "[STATS] cumulative tx_errors=" << tx_errors
+                          << " rx_errors=" << rx_errors << " invalid=" << invalid << std::endl;
+            next_stats = now + std::chrono::seconds(10);
         }
     }
 
     close(tun_fd);
     close(udp_fd);
     std::cout << "\n[INFO] Server shut down gracefully." << std::endl;
-    return 0;
+    return failed ? 1 : 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] " << e.what() << std::endl;
+        return 1;
+    }
 }
